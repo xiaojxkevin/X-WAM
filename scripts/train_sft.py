@@ -62,6 +62,18 @@ def main():
         ),
         ConsoleLogger(max_steps=config.num_training_steps),
     ]
+    if config.get("use_wandb", False):
+        from lightning.pytorch.loggers import WandbLogger
+
+        loggers.append(
+            WandbLogger(
+                project=config.get("wandb_project", "x-wam"),
+                name=config.exp_name,
+                save_dir=os.path.join(config.exp_root, config.exp_name),
+                id=config.get("wandb_run_id", None),
+                resume="allow" if config.get("wandb_run_id", None) else False,
+            )
+        )
     logging.getLogger("lightning.pytorch").setLevel(logging.INFO)
 
     train_dataset = RobotDataset(

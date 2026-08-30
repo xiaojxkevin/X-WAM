@@ -3,7 +3,6 @@
 .vscode/
 CLAUDE.md
 
-*.sh
 experiments/
 eval_results/
 checkpoints/
@@ -188,3 +187,5 @@ cython_debug/
 
 #MACOS
 .DS_Store
+
+raw_data/**
