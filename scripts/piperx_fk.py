@@ -40,7 +40,8 @@ class PiperXForwardKinematics:
         - alpha: Link twist (radians)
         - theta_offset: Joint angle offset (radians)
         """
-        # Piper-X MDH parameters (6 joints)
+        # Official pyAgxArm ROBOT_MDH_PRESET["piper_x"] (meters/radians).
+        # Keep the SDK's d6=35.26 mm; the supplied URDF uses 35 mm instead.
         self.mdh_params = [
             (0.123, 0.0, 0.0, 3.141592653589793),
             (0.0, 0.0, 1.5707963267948966, 0.13578661580515886),
@@ -82,12 +83,13 @@ class PiperXForwardKinematics:
             
         Notes
         -----
-        Modified DH convention transformation matrix:
+        Modified DH convention: Rx(alpha) Tx(a) Rz(theta) Tz(d),
+        matching pyAgxArm.utiles.mdh_kinematics.
         
-        T = | cos(θ)  -sin(θ)cos(α)   sin(θ)sin(α)  a·cos(θ) |
-            | sin(θ)   cos(θ)cos(α)  -cos(θ)sin(α)  a·sin(θ) |
-            |    0      sin(α)         cos(α)           d     |
-            |    0        0              0               1     |
+        T = |    cos(θ)       -sin(θ)       0          a      |
+            | sin(θ)cos(α)  cos(θ)cos(α)  -sin(α)  -d·sin(α) |
+            | sin(θ)sin(α)  cos(θ)sin(α)   cos(α)   d·cos(α) |
+            |       0             0          0          1      |
         """
         cos_theta = np.cos(theta)
         sin_theta = np.sin(theta)
@@ -96,9 +98,9 @@ class PiperXForwardKinematics:
         
         # Build the 4x4 transformation matrix
         T = np.array([
-            [cos_theta, -sin_theta * cos_alpha, sin_theta * sin_alpha, a * cos_theta],
-            [sin_theta, cos_theta * cos_alpha, -cos_theta * sin_alpha, a * sin_theta],
-            [0.0, sin_alpha, cos_alpha, d],
+            [cos_theta, -sin_theta, 0.0, a],
+            [sin_theta * cos_alpha, cos_theta * cos_alpha, -sin_alpha, -d * sin_alpha],
+            [sin_theta * sin_alpha, cos_theta * sin_alpha, cos_alpha, d * cos_alpha],
             [0.0, 0.0, 0.0, 1.0]
         ])
         
@@ -136,17 +138,15 @@ class PiperXForwardKinematics:
         # Check for gimbal lock (singularity at pitch = ±π/2)
         cos_pitch = np.cos(pitch)
         
-        if abs(cos_pitch) < 1e-6:
+        if abs(cos_pitch) < 1e-9:
             # Gimbal lock: set roll to 0 and solve for yaw
             roll = 0.0
-            if sin_pitch > 0:  # pitch ≈ π/2
-                yaw = np.arctan2(-R[0, 1], R[1, 1])
-            else:  # pitch ≈ -π/2
-                yaw = np.arctan2(R[0, 1], R[1, 1])
+            # The same expression applies at both signs of pitch.
+            yaw = np.arctan2(-R[0, 1], R[1, 1])
         else:
             # Normal case: extract roll and yaw
-            roll = np.arctan2(R[2, 1] / cos_pitch, R[2, 2] / cos_pitch)
-            yaw = np.arctan2(R[1, 0] / cos_pitch, R[0, 0] / cos_pitch)
+            roll = np.arctan2(R[2, 1], R[2, 2])
+            yaw = np.arctan2(R[1, 0], R[0, 0])
         
         return roll, pitch, yaw
     

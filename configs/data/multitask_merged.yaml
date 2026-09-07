@@ -1,0 +1,73 @@
+dataset_path: "./sft_datasets/multitask_merged/"
+sequence_length: 9
+frame_skip: 4
+action_skip: 1
+video_size: [256, 320]
+augment: true
+crop_ratio: 0.95
+brightness: 0.2
+contrast: 0.2
+saturation: 0.2
+hue: 0.05
+inverse_gripper: false
+normalize_depths_per_view: false
+shuffle_view_order: false
+statistics:
+  q01:
+    proprio_left_ee_xyz:
+    - 0.08344462723384571
+    - -0.25256673318623735
+    - 0.004818608261515731
+    proprio_right_ee_xyz:
+    - 0.08181836444204559
+    - -0.009323705483247716
+    - 0.05547979007427326
+    gripper_pos:
+    - 0.0
+    action_left_ee_xyz:
+    - -0.022366345426368662
+    - -0.01889844680529917
+    - -0.04029990299614558
+    action_right_ee_xyz:
+    - -0.02842322600142822
+    - -0.021101894347501843
+    - -0.045297545328802
+    action_left_ee_axisangle:
+    - -0.07956043502731144
+    - -0.11815005254105328
+    - -0.08697045694723587
+    action_right_ee_axisangle:
+    - -0.16395182004843165
+    - -0.14834613448865439
+    - -0.09299016996092456
+    gripper_action:
+    - -0.2373647689819336
+  q99:
+    proprio_left_ee_xyz:
+    - 0.44690438429577517
+    - 0.018143340131373357
+    - 0.3622520779249286
+    proprio_right_ee_xyz:
+    - 0.48932319406125263
+    - 0.27880957603058903
+    - 0.37716618644179406
+    gripper_pos:
+    - 1.7400932312011719
+    action_left_ee_xyz:
+    - 0.022366345426368662
+    - 0.01889844680529917
+    - 0.04029990299614558
+    action_right_ee_xyz:
+    - 0.02842322600142822
+    - 0.021101894347501843
+    - 0.045297545328802
+    action_left_ee_axisangle:
+    - 0.07956043502731144
+    - 0.11815005254105328
+    - 0.08697045694723587
+    action_right_ee_axisangle:
+    - 0.16395182004843165
+    - 0.14834613448865439
+    - 0.09299016996092456
+    gripper_action:
+    - 0.2373647689819336

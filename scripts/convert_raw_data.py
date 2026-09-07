@@ -21,7 +21,7 @@ Usage::
     python scripts/convert_raw_data.py \
         --src raw_data/<task>_v1 \
         --dst sft_datasets/<task> \
-        [--workers 16] [--depth-max-m 3.0] [--depth-scale-m 0.001]
+        [--workers 16] [--depth-max-m 3.0] [--depth-scale-m 0.001] [--use-gpu]
 """
 
 import argparse
@@ -46,6 +46,8 @@ CAMERA_VIEW_MAP = {
 NUM_JOINTS = 6
 # state/action layout: [left_j1..j6, left_gripper, right_j1..j6, right_gripper]
 
+USE_GPU = False  # NVENC H.264 encoding for RGB/depth; requires ffmpeg with h264_nvenc
+
 
 def run_ffmpeg(cmd: list[str]) -> None:
     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -54,10 +56,14 @@ def run_ffmpeg(cmd: list[str]) -> None:
 
 
 def transcode_rgb(src: Path, dst: Path, fps: float) -> None:
+    if USE_GPU:
+        codec = ["-c:v", "h264_nvenc", "-rc", "vbr", "-cq", "14", "-preset", "p4"]
+    else:
+        codec = ["-c:v", "libx264", "-crf", "14", "-preset", "medium"]
     cmd = [
         "ffmpeg", "-y", "-v", "error", "-i", str(src),
         "-vf", "format=yuv420p",
-        "-c:v", "libx264", "-crf", "14", "-preset", "medium",
+        *codec,
         "-r", f"{fps}", "-an", str(dst),
     ]
     run_ffmpeg(cmd)
@@ -88,12 +94,17 @@ def encode_depth(depth_u16: np.ndarray, dst: Path, fps: float, scale_m: float, m
     v8 = np.clip(depth_m / max_m, 0.0, 1.0)
     v8 = np.round(v8 * 255.0).astype(np.uint8)  # [T, H, W]
     t, h, w = v8.shape
+    if USE_GPU:
+        # Lossless: NVENC high-throughput lossless mode (bit-exact, no qp 0 lossy)
+        codec = ["-c:v", "h264_nvenc", "-preset", "lossless"]
+    else:
+        codec = ["-c:v", "libx264", "-qp", "0", "-preset", "medium"]
     cmd = [
         "ffmpeg", "-y", "-v", "error",
         "-f", "rawvideo", "-pix_fmt", "gray", "-s", f"{w}x{h}", "-r", f"{fps}",
         "-i", "-",
         "-vf", "format=yuv420p",
-        "-c:v", "libx264", "-qp", "0", "-preset", "medium",
+        *codec,
         "-an", str(dst),
     ]
     proc = subprocess.run(cmd, input=v8.tobytes(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -219,8 +230,26 @@ def main() -> None:
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--depth-scale-m", type=float, default=0.001, help="uint16 raw -> meters scale.")
-    parser.add_argument("--depth-max-m", type=float, default=3.0, help="Meters clipped to 8-bit max.")
+    parser.add_argument("--depth-max-m", type=float, default=1.2, help="Meters clipped to 8-bit max.")
+    parser.add_argument("--use-gpu", action="store_true",
+                        help="Use NVENC (h264_nvenc) for H.264 encoding instead of libx264. "
+                             "Requires an NVIDIA GPU with ffmpeg nvenc support.")
     args = parser.parse_args()
+
+    global USE_GPU
+    USE_GPU = args.use_gpu
+    if USE_GPU:
+        probe = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", "color=black:s=64x64:d=0.04",
+             "-c:v", "h264_nvenc", "-f", "null", "-"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        if probe.returncode != 0:
+            raise RuntimeError(
+                "h264_nvenc not available in this ffmpeg build / no usable GPU:\n"
+                f"{probe.stderr.decode()[-1000:]}"
+            )
+        print("GPU encoding enabled (h264_nvenc)")
 
     src_root: Path = args.src.resolve()
     dst_root: Path = args.dst.resolve()
