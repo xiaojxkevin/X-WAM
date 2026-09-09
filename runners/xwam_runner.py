@@ -15,25 +15,31 @@ from utils.utils import sample_beta
 
 
 class XWAMRunner(L.LightningModule):
-    def __init__(self, config, run_depth=True):
+    def __init__(self, config, run_depth=True, skip_text_encoder=False):
         super().__init__()
         self.config = config
         self.run_depth = run_depth
+        self.skip_text_encoder = skip_text_encoder
 
         # TODO: remove hard-coded views and modalities
         self.num_views = 3
         self.num_modalities = 2 if config.use_depth else 1
         self.num_frames_per_latent = config.vae_stride[0]
 
-        logging.info(f"Loading Wan2_2_VAE from {config.wan_checkpoint_dir}...")
-        self.text_encoder = T5EncoderModel(
-            text_len=config.text_len,
-            dtype=eval(config.t5_dtype),
-            device=torch.device("cpu"),
-            checkpoint_path=os.path.join(config.wan_checkpoint_dir, config.t5_checkpoint),
-            tokenizer_path=os.path.join(config.wan_checkpoint_dir, config.t5_tokenizer),
-        )
-        self.text_encoder.eval()
+        if skip_text_encoder:
+            # Deployment mode: pre-encoded prompt embeddings are passed to
+            # generate()/forward() directly; the 11 GB T5 encoder is never loaded.
+            self.text_encoder = None
+        else:
+            logging.info(f"Loading Wan2_2_VAE from {config.wan_checkpoint_dir}...")
+            self.text_encoder = T5EncoderModel(
+                text_len=config.text_len,
+                dtype=eval(config.t5_dtype),
+                device=torch.device("cpu"),
+                checkpoint_path=os.path.join(config.wan_checkpoint_dir, config.t5_checkpoint),
+                tokenizer_path=os.path.join(config.wan_checkpoint_dir, config.t5_tokenizer),
+            )
+            self.text_encoder.eval()
         self.vae = Wan2_2_VAE(vae_pth=os.path.join(config.wan_checkpoint_dir, config.vae_checkpoint))
         self.vae.eval()
         self.vae.requires_grad_(False)
@@ -388,10 +394,22 @@ class XWAMRunner(L.LightningModule):
 
         return None
 
-    def forward(self, batch, seeds=None, early_stop=False, cfg=0.0):
+    def forward(self, batch, seeds=None, early_stop=False, cfg=0.0, prompt_embedding=None):
         # 1. prepare condition
-        context_embeddings, gt_latents, _ = self._prepare_condition(batch)
-        B, C, T, MV, H, W = gt_latents.shape
+        if prompt_embedding is not None:
+            # Pre-encoded text embeddings bypass T5 entirely ([B, L, text_dim]).
+            # VAE conditioning mirrors _prepare_condition: the (repeated) current
+            # frame sequence is encoded with the causal VAE so all latent frames
+            # match the original path bit-for-bit (only frame 0 is kept clean).
+            rgb = batch["video"][:, :, 0]
+            B = prompt_embedding.shape[0]
+            context_embeddings = prompt_embedding
+            gt_latents = self.vae.encode(rearrange(batch["video"], "b v t c h w -> (b v) c t h w"))
+            gt_latents = rearrange(gt_latents, "(b v) c t h w -> b c t v h w", b=B, v=self.num_views)
+            _, _, T, _, _, _ = gt_latents.shape
+        else:
+            context_embeddings, gt_latents, _ = self._prepare_condition(batch)
+            B, C, T, MV, H, W = gt_latents.shape
         gt_actions = batch["actions"].float()
         gt_proprios = batch["proprios"].float()
 
@@ -529,13 +547,16 @@ class XWAMRunner(L.LightningModule):
         xt_depth_latents = depth_latents_pred[0] if self.config.use_depth and self.run_depth else None
         return xt_latents, xt_actions, xt_proprios, xt_depth_latents
 
-    def generate(self, rgb, proprio, prompt, seeds=None, early_stop=True, cfg=0.0, run_depth=True):
+    def generate(
+        self, rgb, proprio, prompt, seeds=None, early_stop=True, cfg=0.0, run_depth=True, prompt_embedding=None
+    ):
         """
         Args:
             rgb: [B, V, C, H, W]
             proprio: [B, Dp]
             prompt: list[str] with length B
-            prompt_embedding: [B, L, text_dim]
+            prompt_embedding: [B, L, text_dim] pre-encoded T5 output; bypasses T5
+                entirely when given (prompt may then be empty/None).
             seeds: optional list[int] of length B for reproducible noise generation
             cfg: classifier-free guidance scale
         """
@@ -548,12 +569,12 @@ class XWAMRunner(L.LightningModule):
             "video": rgb.unsqueeze(2).repeat(1, 1, T, 1, 1, 1),
             "proprios": proprio.unsqueeze(1).repeat(1, Tp, 1),
             "actions": torch.zeros((B, Ta, self.config.action_dim)).to(proprio.device, dtype=proprio.dtype),
-            "prompt": prompt,
+            "prompt": prompt if prompt is not None else [],
         }
 
         self.run_depth = run_depth
         xt_latents, xt_actions, xt_proprios, xt_depth_latents = self.forward(
-            batch, seeds=seeds, early_stop=early_stop, cfg=cfg
+            batch, seeds=seeds, early_stop=early_stop, cfg=cfg, prompt_embedding=prompt_embedding
         )
 
         if early_stop:

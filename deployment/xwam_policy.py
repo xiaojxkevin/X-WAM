@@ -77,9 +77,11 @@ def resize_and_center_crop(tensor: torch.Tensor, resized_shape: tuple[int, int],
     crop_h, crop_w = int(H * crop_ratio), int(W * crop_ratio)
     top, left = (H - crop_h) // 2, (W - crop_w) // 2
     tensor = tensor[:, :, :, top : top + crop_h, left : left + crop_w]
-    return TF.resize(
+    tensor = tensor.flatten(0, 1)
+    tensor = TF.resize(
         tensor, size=list(resized_shape), interpolation=TF.InterpolationMode.BILINEAR, antialias=False
     )
+    return tensor.unflatten(0, (B, V))
 
 
 def _rotm_to_canonical_quat_wxyz(rotm: np.ndarray) -> np.ndarray:
@@ -103,6 +105,7 @@ class XWAMPolicy:
         action_denoise_steps: int = 10,
         device: str = "cuda",
         compile_model: bool = False,
+        prompt_embeddings: str | None = None,
     ):
         self.exp_path = exp_path
         config = OmegaConf.load(os.path.join(exp_path, "config.yaml"))
@@ -110,6 +113,9 @@ class XWAMPolicy:
         config.use_decoupled_inference = action_denoise_steps > 0
         config.action_denoise_steps = action_denoise_steps
         config.action_num = config.dataset.frame_skip // config.dataset.action_skip
+        # The real-robot endpoint returns actions/proprios only. Avoid constructing
+        # the checkpoint's unused depth blocks so they never occupy GPU memory.
+        config.use_depth = False
 
         if wan_checkpoint_dir is not None:
             config.wan_checkpoint_dir = wan_checkpoint_dir
@@ -127,17 +133,55 @@ class XWAMPolicy:
 
         self.state_q01, self.state_q99, self.action_q01, self.action_q99 = self._build_statistics(config)
 
+        # Pre-encoded T5 prompt embeddings: when provided, T5 is never loaded
+        # (saves ~11 GB) and "prompt" must exactly match one of the encoded tasks.
+        self.prompt_to_embedding = None
+        self.tasks: list[str] = []
+        emb_path = prompt_embeddings or os.path.join(exp_path, "prompt_embeddings.pt")
+        if emb_path and os.path.exists(emb_path):
+            blob = torch.load(emb_path, map_location="cpu")
+            self.tasks = list(blob["prompts"])
+            self._prompt_embeddings = blob["embeddings"]  # [N, L, D] bf16, kept on CPU
+            self.prompt_to_embedding = {p: i for i, p in enumerate(self.tasks)}
+            logging.info(
+                "Loaded prompt embeddings for %d tasks from %s (T5 will be skipped).", len(self.tasks), emb_path
+            )
+
         logging.info(f"Loading X-WAM policy from {exp_path} (steps={steps}) ...")
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-        self.model = XWAMRunner(config=config).to(device).bfloat16()
         ckpt_path = os.path.join(exp_path, f"checkpoints/{steps}.ckpt/checkpoint/mp_rank_00_model_states.pt")
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+        # Keep the FP32 -> BF16 conversion and checkpoint loading on CPU.  Moving
+        # the runner to CUDA first (the old order) temporarily allocates the full
+        # FP32 model on the GPU and leaves the freed blocks in the CUDA allocator,
+        # making startup appear to consume substantially more VRAM than the
+        # steady-state BF16 model.
+        self.model = XWAMRunner(config=config, skip_text_encoder=self.prompt_to_embedding is not None).bfloat16()
+        self.model.vae.dtype = torch.bfloat16
         ckpt = torch.load(ckpt_path, map_location="cpu")
-        self.model.load_state_dict(ckpt["module"])
+        incompatible = self.model.load_state_dict(ckpt["module"], strict=False)
+        allowed_unexpected_prefixes = (
+            "model.extra_blocks.",
+            "model.extra_heads.",
+            "text_encoder.",  # T5 skipped when pre-encoded prompt embeddings are used
+        )
+        invalid_unexpected = [
+            key for key in incompatible.unexpected_keys if not key.startswith(allowed_unexpected_prefixes)
+        ]
+        if incompatible.missing_keys or invalid_unexpected:
+            raise RuntimeError(
+                "Checkpoint mismatch outside the disabled depth branch: "
+                f"missing={incompatible.missing_keys}, unexpected={invalid_unexpected}"
+            )
+        logging.info("Skipped %d unused depth-branch checkpoint tensors.", len(incompatible.unexpected_keys))
+        del ckpt
+        self.model = self.model.to(device)
         self.model.eval()
+        torch.cuda.empty_cache()
         if compile_model:
             self.model.model = torch.compile(self.model.model)
         self._fk = PiperXForwardKinematics()
@@ -221,9 +265,22 @@ class XWAMPolicy:
         if isinstance(prompt, str):
             prompt = [prompt]
 
+        if self.prompt_to_embedding is not None:
+            if len(prompt) != 1 or prompt[0] not in self.prompt_to_embedding:
+                raise ValueError(
+                    f"prompt must be exactly one of the pre-encoded tasks: {self.tasks} (got {prompt!r})"
+                )
+            idx = self.prompt_to_embedding[prompt[0]]
+            prompt_embedding = self._prompt_embeddings[idx : idx + 1].to(self.device, dtype=torch.bfloat16)
+        else:
+            prompt_embedding = None
+
         seed = int(payload.get("seed", np.random.randint(0, 2**31 - 1)))
-        cfg = float(payload.get("cfg", 0.0))
-        return rgb, proprio, prompt, seed, cfg
+        requested_cfg = float(payload.get("cfg", 0.0))
+        if requested_cfg != 0.0:
+            logging.warning("Ignoring cfg=%s; the memory-optimized policy fixes CFG at 0.0.", requested_cfg)
+        cfg = 0.0
+        return rgb, proprio, prompt, seed, cfg, prompt_embedding
 
     # ------------------------------------------------------------------ #
     # Inference
@@ -232,10 +289,11 @@ class XWAMPolicy:
     @torch.inference_mode()
     def infer(self, payload: dict) -> dict:
         t0 = time.time()
-        rgb, proprio, prompt, seed, cfg = self._parse_observation(payload)
+        rgb, proprio, prompt, seed, cfg, prompt_embedding = self._parse_observation(payload)
 
         _, xt_actions, xt_proprios, _ = self.model.generate(
-            rgb, proprio, prompt, seeds=[seed], early_stop=True, cfg=cfg, run_depth=False
+            rgb, proprio, prompt, seeds=[seed], early_stop=True, cfg=cfg, run_depth=False,
+            prompt_embedding=prompt_embedding,
         )
 
         actions_np = xt_actions[0].float().cpu().numpy()

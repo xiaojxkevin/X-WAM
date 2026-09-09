@@ -67,6 +67,8 @@ class WebSocketPolicyServer:
             "proprio_fps": p.raw_fps / p.frame_skip,
             "sample_steps": p.config.sample_steps,
             "action_denoise_steps": p.config.action_denoise_steps,
+            "tasks": p.tasks,
+            "prompt_must_be_task": bool(p.prompt_to_embedding),
         }
 
     async def _handler(self, websocket) -> None:
@@ -121,6 +123,13 @@ def main() -> None:
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--compile", action="store_true", help="torch.compile the DiT (slower startup, faster steady-state).")
+    parser.add_argument(
+        "--prompt-embeddings",
+        type=str,
+        default=None,
+        help="prompt_embeddings.pt from deployment/precompute_prompt_embeddings.py "
+        "(default: <exp-path>/prompt_embeddings.pt if present). Skips loading T5.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -131,6 +140,7 @@ def main() -> None:
         denoise_steps=args.denoise_steps,
         action_denoise_steps=args.action_denoise_steps,
         compile_model=args.compile,
+        prompt_embeddings=args.prompt_embeddings,
     )
     server = WebSocketPolicyServer(policy, host=args.host, port=args.port)
     asyncio.run(server.serve())
