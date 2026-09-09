@@ -106,6 +106,7 @@ class XWAMPolicy:
         device: str = "cuda",
         compile_model: bool = False,
         prompt_embeddings: str | None = None,
+        deployment_checkpoint: str | None = None,
     ):
         self.exp_path = exp_path
         config = OmegaConf.load(os.path.join(exp_path, "config.yaml"))
@@ -151,34 +152,70 @@ class XWAMPolicy:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-        ckpt_path = os.path.join(exp_path, f"checkpoints/{steps}.ckpt/checkpoint/mp_rank_00_model_states.pt")
-        if not os.path.exists(ckpt_path):
-            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        if deployment_checkpoint is not None:
+            checkpoint_candidates = (deployment_checkpoint,)
+        else:
+            checkpoint_root = os.path.join(exp_path, f"checkpoints/{steps}.ckpt")
+            checkpoint_candidates = (
+                os.path.join(checkpoint_root, "checkpoint", "mp_rank_00_model_states.pt"),
+                os.path.join(checkpoint_root, "checkpoints", "mp_rank_00_model_states.pt"),
+            )
+        ckpt_path = next((path for path in checkpoint_candidates if os.path.isfile(path)), None)
+        if ckpt_path is None:
+            raise FileNotFoundError(
+                "Checkpoint not found. Looked for: " + ", ".join(checkpoint_candidates)
+            )
 
-        # Keep the FP32 -> BF16 conversion and checkpoint loading on CPU.  Moving
-        # the runner to CUDA first (the old order) temporarily allocates the full
-        # FP32 model on the GPU and leaves the freed blocks in the CUDA allocator,
-        # making startup appear to consume substantially more VRAM than the
-        # steady-state BF16 model.
-        self.model = XWAMRunner(config=config, skip_text_encoder=self.prompt_to_embedding is not None).bfloat16()
+        # A deployment checkpoint is complete for no-depth serving: construct
+        # DiT and VAE architecture on meta, then assign its tensors directly
+        # to CUDA. This avoids loading either the base DiT safetensors or the
+        # base VAE checkpoint first.
+        deployment_state_only = deployment_checkpoint is not None
+        self.model = XWAMRunner(
+            config=config,
+            skip_text_encoder=self.prompt_to_embedding is not None,
+            deployment_state_only=deployment_state_only,
+        )
         self.model.vae.dtype = torch.bfloat16
-        ckpt = torch.load(ckpt_path, map_location="cpu")
-        incompatible = self.model.load_state_dict(ckpt["module"], strict=False)
+        # mmap prevents the 37 GB DeepSpeed state from being copied wholesale
+        # into anonymous CPU memory.  load_state_dict only faults the weights
+        # required by the no-depth runner.
+        checkpoint_device = device if deployment_state_only else "cpu"
+        ckpt = torch.load(ckpt_path, map_location=checkpoint_device, weights_only=True, mmap=True)
+        incompatible = self.model.load_state_dict(
+            ckpt["module"], strict=False, assign=deployment_state_only
+        )
+        incompatible_missing = incompatible.missing_keys
+        incompatible_unexpected = incompatible.unexpected_keys
+        del ckpt
         allowed_unexpected_prefixes = (
             "model.extra_blocks.",
             "model.extra_heads.",
             "text_encoder.",  # T5 skipped when pre-encoded prompt embeddings are used
         )
         invalid_unexpected = [
-            key for key in incompatible.unexpected_keys if not key.startswith(allowed_unexpected_prefixes)
+            key for key in incompatible_unexpected if not key.startswith(allowed_unexpected_prefixes)
         ]
-        if incompatible.missing_keys or invalid_unexpected:
+        if incompatible_missing or invalid_unexpected:
             raise RuntimeError(
                 "Checkpoint mismatch outside the disabled depth branch: "
-                f"missing={incompatible.missing_keys}, unexpected={invalid_unexpected}"
+                f"missing={incompatible_missing}, unexpected={invalid_unexpected}"
             )
-        logging.info("Skipped %d unused depth-branch checkpoint tensors.", len(incompatible.unexpected_keys))
-        del ckpt
+        logging.info("Skipped %d unused checkpoint tensors.", len(incompatible_unexpected))
+        if deployment_state_only:
+            non_cuda_parameters = [name for name, param in self.model.named_parameters() if not param.is_cuda]
+            if non_cuda_parameters:
+                raise RuntimeError(
+                    "Deployment checkpoint did not assign all model weights to CUDA; "
+                    f"first non-CUDA key: {non_cuda_parameters[0]}"
+                )
+        # ``assign=True`` puts deployment tensors directly on CUDA, but it
+        # bypasses LightningModule.to(), leaving its private ``_device`` at
+        # the CPU default. XWAMRunner uses ``self.device`` to create the
+        # sampling masks/noise, which then conflicts with VAE latents on CUDA.
+        # Calling .to(cuda) here is storage-preserving for tensors already on
+        # CUDA; it only updates Lightning's device bookkeeping (and any small
+        # residual CPU buffers).
         self.model = self.model.to(device)
         self.model.eval()
         torch.cuda.empty_cache()
@@ -241,6 +278,12 @@ class XWAMPolicy:
         if images.ndim != 4 or images.shape[-1] != 3:
             raise ValueError(f"images must be [V, H, W, 3], got {images.shape}.")
 
+        # OpenPI's MessagePack decoder deliberately creates zero-copy ndarray
+        # views over an immutable bytes payload. ``torch.from_numpy`` warns for
+        # such arrays even though this preprocessing never mutates the source.
+        # Copy only in that case to make the ownership explicit and safe.
+        if not images.flags.writeable:
+            images = images.copy()
         rgb = torch.from_numpy(images).float().unsqueeze(0)  # [1, V, H, W, 3]
         rgb = rgb.permute(0, 1, 4, 2, 3)  # -> [B, V, C, H, W]
         rgb = resize_and_center_crop(rgb, self.video_size, self.crop_ratio)

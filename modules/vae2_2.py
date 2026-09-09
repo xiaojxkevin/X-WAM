@@ -831,9 +831,15 @@ def _video_vae(pretrained_path=None, z_dim=16, dim=160, device="cpu", **kwargs):
     with torch.device("meta"):
         model = WanVAE_(**cfg)
 
-    # load checkpoint
-    logging.info(f"loading {pretrained_path}")
-    model.load_state_dict(torch.load(pretrained_path, map_location=device), assign=True)
+    # In inference-only deployment, the VAE weights come from the trimmed
+    # deployment checkpoint and are assigned later directly on CUDA. Keeping
+    # this architecture on meta avoids reading Wan2.2_VAE.pth at startup.
+    if pretrained_path is not None:
+        logging.info(f"loading {pretrained_path}")
+        model.load_state_dict(
+            torch.load(pretrained_path, map_location=device, weights_only=True, mmap=True),
+            assign=True,
+        )
 
     return model
 

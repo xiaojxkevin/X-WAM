@@ -5,31 +5,30 @@ plain ``websockets`` + ``msgpack``. If the robot already has ``openpi_client``
 installed, ``WebsocketClientPolicy`` works identically.
 
 Protocol:
-  - send one binary frame: msgpack(packb, numpy via msgpack_numpy) dict
+  - send one binary frame: msgpack(packb, numpy via the bundled OpenPI codec) dict
   - receive one binary frame: msgpack dict
 """
 
 import json
 import numpy as np
-import msgpack
-import msgpack_numpy
 import websockets
+
+import openpi_msgpack_numpy
 
 SERVER = "ws://10.0.0.5:8080"  # <-- server host:port
 
 
 def pack(obj: dict) -> bytes:
-    return msgpack.packb(obj, default=msgpack_numpy.encode, use_bin_type=True)
+    return openpi_msgpack_numpy.packb(obj)
 
 
 def unpack(data: bytes) -> dict:
-    return msgpack.unpackb(data, object_hook=msgpack_numpy.decode, raw=False)
+    return openpi_msgpack_numpy.unpackb(data, raw=False)
 
 
 async def main() -> None:
     async with websockets.connect(SERVER, max_size=64 * 1024 * 1024) as ws:
-        # 1. optional: fetch server metadata
-        await ws.send(pack({"command": "get_config"}))
+        # 1. the server sends OpenPI-compatible metadata immediately after the handshake
         meta = unpack(await ws.recv())
         print("server metadata:", json.dumps(meta, indent=2))
 

@@ -2,7 +2,8 @@
 
 OpenPI-style WebSocket server serving an X-WAM SFT checkpoint for real-robot
 control. One binary websocket frame per request; payload/result are python
-dicts serialized with msgpack + msgpack-numpy (numpy arrays travel inline).
+dicts serialized with msgpack plus the bundled OpenPI-compatible NumPy codec
+(numpy arrays travel inline).
 
 ## Server components
 
@@ -10,6 +11,7 @@ dicts serialized with msgpack + msgpack-numpy (numpy arrays travel inline).
 |---|---|
 | `websocket_policy_server.py` | WebSocket server (openpi-compatible wire protocol) |
 | `xwam_policy.py` | Inference wrapper: preprocessing, checkpoint loading, denormalization |
+| `export_deployment_checkpoint.py` | One-time DeepSpeed checkpoint trimming for real-robot serving |
 | `precompute_prompt_embeddings.py` | Offline T5 prompt-embedding pre-encoding (small-GPU deployment) |
 | `lerobot_client_example.py` | Minimal client example (no `openpi_client` dependency) |
 
@@ -17,8 +19,9 @@ dicts serialized with msgpack + msgpack-numpy (numpy arrays travel inline).
 
 - `<exp-path>/config.yaml` — model/data config, quantile statistics (q01/q99),
   `video_size`, `crop_ratio`, `fps`, `frame_skip`, `action_skip`
-- `<exp-path>/checkpoints/<steps>.ckpt/checkpoint/mp_rank_00_model_states.pt` —
-  DeepSpeed ZeRO model weights (only `module`; depth branch + T5 tensors skipped)
+- `<exp-path>/checkpoints/<steps>.ckpt/checkpoints/mp_rank_00_model_states.pt` —
+  DeepSpeed ZeRO model weights. It is memory-mapped at startup; only tensors
+  needed by the no-depth model are faulted into RAM.
 - `wan_checkpoint_dir` (default from config, e.g. `./checkpoints/Wan2.2-TI2V-5B/`) —
   VAE (`Wan2.2_VAE.pth`), DiT architecture + base weights
   (`diffusion_pytorch_model-*.safetensors`)
@@ -26,26 +29,53 @@ dicts serialized with msgpack + msgpack-numpy (numpy arrays travel inline).
   `--prompt-embeddings`) — pre-encoded T5 prompt embeddings. When present, the
   11 GB T5 encoder is **not loaded** and `prompt` must be exactly one of the
   encoded task strings. Peak VRAM ~12 GB (fits a 24 GB RTX 3090).
+- `<exp-path>/checkpoints/<steps>.deployment.pt` (generated above) is the
+  preferred serving input. It contains the no-depth DiT and VAE weights, so
+  the server builds their architecture on meta and assigns this checkpoint
+  directly to CUDA; it does not first read the base DiT safetensors or
+  `Wan2.2_VAE.pth`.
 
 ## Running
 
+Ensure the X-WAM environment has been synchronized first; deployment additionally
+requires `msgpack` and `websockets` for the WebSocket wire protocol:
+
 ```bash
-# 1. (one-time) pre-encode the task prompts
+uv lock && uv sync
+```
+
+```bash
+# 1. (one-time) create the inference-only checkpoint (CPU only; no GPU required)
+.venv/bin/python deployment/export_deployment_checkpoint.py \
+    --source experiments/multitask_merged-v1-sft/checkpoints/last.ckpt/checkpoints/mp_rank_00_model_states.pt \
+    --destination experiments/multitask_merged-v1-sft/checkpoints/last.deployment.pt
+
+# 2. (one-time) pre-encode the task prompts
 .venv/bin/python deployment/precompute_prompt_embeddings.py \
     --tasks-jsonl raw_data/multitask_merged_v1/meta/tasks.jsonl \
     --wan-checkpoint-dir ./checkpoints/Wan2.2-TI2V-5B \
     --config experiments/multitask_merged-v1-sft/config.yaml \
     --dst experiments/multitask_merged-v1-sft
 
-# 2. start the server
+# 3. start the server
 .venv/bin/python deployment/websocket_policy_server.py \
     --exp-path experiments/multitask_merged-v1-sft \
     --host 0.0.0.0 --port 8080
 ```
 
+The equivalent wrapper, which fixes the current experiment/base-weight defaults, is:
+
+```bash
+bash deployment/serve_xwam.sh
+```
+
 ## Wire protocol
 
-One binary frame per request, msgpack dict. Control commands:
+Immediately after the WebSocket handshake, the server sends one binary msgpack
+frame: `{"metadata": ...}`. This is required by OpenPI's
+`WebsocketClientPolicy`. One binary frame per inference request follows.
+
+Control commands (mainly useful for clients that reconnect or need to refresh metadata):
 
 - `{"command": "get_config"}` → server metadata (see below)
 - `{"command": "ping"}` → `{"pong": <unix ts>}`
@@ -90,10 +120,12 @@ For `multitask_merged-v1-sft`: `Ta = 32` (i.e. `(frame_num-1) * frame_skip / act
   "crop_ratio": 0.95,
   "proprio_dim": 16,
   "action_dim": 14,
+  "action_horizon": 32,
   "action_fps": 30.0,
   "proprio_fps": 7.5,
   "sample_steps": 50,
   "action_denoise_steps": 10,
+  "action_representation": "delta_ee_global_relative_to_request",
   "tasks": ["...5 task strings..."],
   "prompt_must_be_task": true
 }
@@ -112,9 +144,12 @@ result = policy.infer({"images": rgb, "agent_pos": joints, "prompt": "Fold the t
 
 ## Conventions & gotchas
 
-- **No video/depth prediction at serving time** — only actions/proprios are
-  returned (depth branch is not even constructed; video latents participate
-  internally as conditions only).
+- **Video latent sampling is retained at serving time** — video predictions
+  are not sent to the client, but their denoising trajectory conditions the
+  action/proprio predictions. Depth branches are not constructed.
+- Startup uses memory-mapped checkpoint loading and direct BF16 base-model
+  construction. This avoids the previous CPU peak where the full 37 GB SFT
+  checkpoint and an FP32 base model could coexist in RAM.
 - Image preprocessing (identical to `evaluation/policy_server.py`):
   resize → center crop (`crop_ratio`) → resize back, then `/127.5 - 1`
   normalization. Do **not** pre-normalize images.

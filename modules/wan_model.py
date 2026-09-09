@@ -439,9 +439,27 @@ class XWAMModel(ModelMixin, ConfigMixin):
             nn.Linear(dim, dim), nn.GELU(approximate="tanh"), nn.Linear(dim, proprio_dim)
         )
 
-        # buffers (don't use register_buffer otherwise dtype will be changed in to())
+        # Caches rather than registered buffers: RoPE must remain complex128,
+        # while ``Module.to(dtype=...)`` would cast registered buffers.  In
+        # deployment mode this constructor runs under ``torch.device('meta')``;
+        # `_create_freqs` will materialize these small caches on the first CUDA
+        # forward pass.
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
-        d = dim // num_heads
+        self._init_rope_frequencies()
+
+        self.gradient_checkpointing = False
+
+        # initialize weights
+        self.init_weights()
+
+    def _init_rope_frequencies(self, device: torch.device | None = None) -> None:
+        """Create non-checkpoint RoPE caches, optionally materialized on ``device``.
+
+        These tensors are deliberately not in ``state_dict``.  Recreating them
+        is necessary after a meta-device construction used by direct-GPU
+        deployment loading, because a meta tensor has no storage to copy out.
+        """
+        d = self.dim // self.num_heads
         self.video_freqs = [
             rope_params(1024, d - 4 * (d // 6)),
             rope_params(1024, 2 * (d // 6)),
@@ -449,9 +467,9 @@ class XWAMModel(ModelMixin, ConfigMixin):
         ]
         self.action_freqs = torch.cat(
             [
-                rope_params(1024, d - 4 * (d // 6), scale=action_num * 4),
-                self.video_freqs[1][0:1].repeat(1024 * action_num * 4, 1),
-                self.video_freqs[2][0:1].repeat(1024 * action_num * 4, 1),
+                rope_params(1024, d - 4 * (d // 6), scale=self.action_num * 4),
+                self.video_freqs[1][0:1].repeat(1024 * self.action_num * 4, 1),
+                self.video_freqs[2][0:1].repeat(1024 * self.action_num * 4, 1),
             ],
             dim=-1,
         )
@@ -463,15 +481,23 @@ class XWAMModel(ModelMixin, ConfigMixin):
             ],
             dim=-1,
         )
-
-        self.gradient_checkpointing = False
-
-        # initialize weights
-        self.init_weights()
+        if device is not None:
+            self.video_freqs = [freq.to(device) for freq in self.video_freqs]
+            self.action_freqs = self.action_freqs.to(device)
+            self.proprio_freqs = self.proprio_freqs.to(device)
 
     def _create_freqs(self, grid_size: torch.Tensor, start_frame: int = 0):
         device = self.patch_embedding.weight.device
-        if any(freq.device != device for freq in self.video_freqs):
+        if (
+            any(freq.is_meta for freq in self.video_freqs)
+            or self.action_freqs.is_meta
+            or self.proprio_freqs.is_meta
+        ):
+            # The inference-only checkpoint constructs the architecture on
+            # meta and assigns only state-dict tensors to CUDA. RoPE caches
+            # are not state-dict tensors, so rebuild them with real storage.
+            self._init_rope_frequencies(device)
+        elif any(freq.device != device for freq in self.video_freqs):
             self.video_freqs = [freq.to(device) for freq in self.video_freqs]
         if self.action_freqs.device != device:
             self.action_freqs = self.action_freqs.to(device)

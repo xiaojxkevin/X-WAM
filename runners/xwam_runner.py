@@ -15,11 +15,12 @@ from utils.utils import sample_beta
 
 
 class XWAMRunner(L.LightningModule):
-    def __init__(self, config, run_depth=True, skip_text_encoder=False):
+    def __init__(self, config, run_depth=True, skip_text_encoder=False, deployment_state_only=False):
         super().__init__()
         self.config = config
         self.run_depth = run_depth
         self.skip_text_encoder = skip_text_encoder
+        self.deployment_state_only = deployment_state_only
 
         # TODO: remove hard-coded views and modalities
         self.num_views = 3
@@ -40,24 +41,47 @@ class XWAMRunner(L.LightningModule):
                 tokenizer_path=os.path.join(config.wan_checkpoint_dir, config.t5_tokenizer),
             )
             self.text_encoder.eval()
-        self.vae = Wan2_2_VAE(vae_pth=os.path.join(config.wan_checkpoint_dir, config.vae_checkpoint))
+        # The trimmed deployment checkpoint contains ``vae.*``. Construct the
+        # VAE on meta in that mode so Wan2.2_VAE.pth is never read first.
+        self.vae = Wan2_2_VAE(
+            vae_pth=None if deployment_state_only else os.path.join(config.wan_checkpoint_dir, config.vae_checkpoint)
+        )
         self.vae.eval()
         self.vae.requires_grad_(False)
 
         logging.info(f"Creating WanModel from {config.wan_checkpoint_dir}...")
-        self.model = XWAMModel.from_pretrained(
-            config.wan_checkpoint_dir,
-            num_modalities=self.num_modalities,
-            num_views=self.num_views,
-            action_dim=config.action_dim,
-            action_num=config.action_num,
-            proprio_dim=config.proprio_dim,
-            num_extra_layers=config.num_extra_layers,
-            low_cpu_mem_usage=False,
-        )
-        self.model.init_new_weights()
-        print("Copying weights to extra blocks...")
-        self.model.copy_weights_to_extra_blocks()
+        model_kwargs = {
+            "num_modalities": self.num_modalities,
+            "num_views": self.num_views,
+            "action_dim": config.action_dim,
+            "action_num": config.action_num,
+            "proprio_dim": config.proprio_dim,
+            "num_extra_layers": config.num_extra_layers,
+        }
+        if deployment_state_only:
+            # All parameters are present in last.deployment.pt. Creating the
+            # architecture on meta avoids loading the 18.8 GiB base DiT first.
+            base_config, unused_kwargs = XWAMModel.load_config(
+                config.wan_checkpoint_dir, return_unused_kwargs=True
+            )
+            if unused_kwargs:
+                raise ValueError(f"Unexpected Wan model configuration keys: {unused_kwargs}")
+            with torch.device("meta"):
+                self.model = XWAMModel.from_config(base_config, **model_kwargs)
+        else:
+            self.model = XWAMModel.from_pretrained(
+                config.wan_checkpoint_dir,
+                **model_kwargs,
+                # Load base weights directly in BF16, avoiding an FP32 -> BF16
+                # duplicate. Do not use Diffusers' meta-device path here: X-WAM's
+                # action/proprio modules are introduced after the base checkpoint
+                # and must be materialised before the SFT state is loaded.
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=False,
+            )
+            self.model.init_new_weights()
+            print("Copying weights to extra blocks...")
+            self.model.copy_weights_to_extra_blocks()
 
         if getattr(self.config, "use_gradient_checkpointing", False):
             print("Enabling gradient checkpointing...")

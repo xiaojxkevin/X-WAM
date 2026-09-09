@@ -21,4 +21,6 @@ omegaconf
 einops
 lightning
 deepspeed>=0.16.0
+msgpack
+websockets>=14
 # flash-attn==2.8.3
