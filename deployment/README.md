@@ -13,6 +13,7 @@ dicts serialized with msgpack plus the bundled OpenPI-compatible NumPy codec
 | `xwam_policy.py` | Inference wrapper: preprocessing, checkpoint loading, denormalization |
 | `export_deployment_checkpoint.py` | One-time DeepSpeed checkpoint trimming for real-robot serving |
 | `precompute_prompt_embeddings.py` | Offline T5 prompt-embedding pre-encoding (small-GPU deployment) |
+| `evaluate_raw_action_fit.py` | GPU-only teacher-forcing test: delta action vs GT, sparse proprio vs GT, and accumulated action pose vs sparse proprio |
 | `lerobot_client_example.py` | Minimal client example (no `openpi_client` dependency) |
 
 ## What the server loads
@@ -108,6 +109,49 @@ Otherwise the dict is an observation.
 
 For `multitask_merged-v1-sft`: `Ta = 32` (i.e. `(frame_num-1) * frame_skip / action_skip`
 = 8*4), `Tp = 9`.
+
+## Offline action-fit replay
+
+This is a read-only, GPU-only diagnostic; it does not start a WebSocket server
+or communicate with the robot. It samples recorded ``RGB[t]`` and joint state
+from a raw LeRobot dataset, runs the same `XWAMPolicy` as deployment, and
+emits exactly three tests:
+
+1. `delta_action_vs_gt`: each raw delta-action token against the exact
+   unnormalised training label, `FK(action[t+h]) - FK(state[t+h])`;
+2. `sparse_proprio_vs_gt`: each predicted absolute sparse EE proprio node
+   against `FK(state[t + node * frame_skip])`; and
+3. `accumulated_absolute_pose_vs_sparse_proprio`: predicted delta actions
+   accumulated with the same global-EE convention as
+   `evaluation/X-WAM/deploy_policy.py::compute_future_poses`, then compared to
+   the predicted sparse proprio nodes at offsets 0, 4, ..., 32.
+
+The third item is an internal consistency diagnostic between two model outputs;
+it is deliberately not a GT metric.
+
+Raw RGB is AV1, so the script extracts selected frames with `ffmpeg` rather
+than decord. It requires `pyarrow` in the X-WAM virtual environment (the raw
+data converter requires it too).
+
+```bash
+.venv/bin/python deployment/evaluate_raw_action_fit.py \
+    --raw-dataset raw_data/place_fruits_in_bucket_v1 \
+    --exp-path experiments/multitask_merged-v1-sft \
+    --wan-checkpoint-dir checkpoints/Wan2.2-TI2V-5B \
+    --deployment-checkpoint experiments/multitask_merged-v1-sft/checkpoints/last.deployment.pt \
+    --max-queries 24 --frame-stride 96 \
+    --output deployment/place_fruits_action_fit.json
+```
+
+The JSON has the three reports under `tests`, both in aggregate and per query.
+Absolute EE position errors are millimetres; orientation uses sign-invariant
+quaternion geodesic degrees; gripper errors are radians. Unless
+`--no-save-actions` is passed, each query also retains the raw predictions, GT,
+and accumulated absolute-action poses. `first_action` is the most direct delta
+teacher-forcing metric; later horizons are an open-loop chunk comparison. By
+default it samples valid action starts in the 10%--90% range of each episode.
+Use `--min-frame-fraction 0 --max-frame-fraction 1` for the all-episode range,
+or set both to `0` for initial-pose-only analysis.
 
 ### `get_config` metadata
 

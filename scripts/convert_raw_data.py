@@ -136,6 +136,7 @@ def convert_episode(
     instructions: list[str],
     depth_scale_m: float,
     depth_max_m: float,
+    depth_dir_name: str = "depths",
 ) -> tuple[int, int]:
     fk = PiperXForwardKinematics()
 
@@ -162,7 +163,7 @@ def convert_episode(
         view_dir_depth.mkdir(parents=True, exist_ok=True)
 
         rgb_src = src_root / "videos" / chunk_src / camera_key / f"episode_{ep6}.mp4"
-        depth_src = src_root / "depths" / camera_key.split(".")[-1] / f"episode-{ep6}.mkv"
+        depth_src = src_root / depth_dir_name / camera_key.split(".")[-1] / f"episode-{ep6}.mkv"
         rgb_dst = view_dir_rgb / f"episode_{ep7}.mp4"
         depth_dst = view_dir_depth / f"episode_{ep7}.mp4"
 
@@ -227,6 +228,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--src", type=Path, required=True, help="LeRobot dataset root (raw_data/<name>).")
     parser.add_argument("--dst", type=Path, required=True, help="Output X-WAM dataset root.")
+    parser.add_argument("--depth-dir-name", type=str, default="depths",
+                        help="Name of depth directory inside --src (e.g., 'depths', 'depths_moge3').")
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--depth-scale-m", type=float, default=0.001, help="uint16 raw -> meters scale.")
@@ -291,6 +294,7 @@ def main() -> None:
                 [str(t) for t in ep["tasks"]],
                 args.depth_scale_m,
                 args.depth_max_m,
+                args.depth_dir_name,
             ): ep
             for ep in episodes
         }
