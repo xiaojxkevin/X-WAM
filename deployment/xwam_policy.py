@@ -30,10 +30,10 @@ Payload (a single python dict, numpy arrays encoded via msgpack on the wire):
 Result:
 
     {
-        "actions": np.float32 [Ta, 14],  # delta EE per step at action_fps:
+        "actions": np.float32 [Ta, 14],  # delta EE correction per step at action_fps:
                                          # [l_dxyz(3), l_drotvec(3), l_dgrip(1), r_...]
-                                         # relative to the CURRENT pose at request time,
-                                         # for steps 1..Ta (all global frame).
+                                         # relative to the state/proprio at that same
+                                         # step (all global frame; do not accumulate).
         "proprios": np.float32 [Tp, 16], # predicted absolute EE chain (video-frame rate),
         "action_fps": float, "proprio_fps": float,
         "view_order": [...], "prompt": str, "seed": int,
@@ -104,7 +104,7 @@ class XWAMPolicy:
         denoise_steps: int = 50,
         action_denoise_steps: int = 10,
         device: str = "cuda",
-        compile_model: bool = False,
+        profile: bool = False,
         prompt_embeddings: str | None = None,
         deployment_checkpoint: str | None = None,
     ):
@@ -131,6 +131,7 @@ class XWAMPolicy:
         self.frame_skip = int(config.dataset.frame_skip)
         self.raw_fps = float(getattr(config.dataset, "fps", 30.0))
         self.view_order = None  # learned from the first request, then fixed
+        self.profile = profile
 
         self.state_q01, self.state_q99, self.action_q01, self.action_q99 = self._build_statistics(config)
 
@@ -151,6 +152,8 @@ class XWAMPolicy:
         logging.info(f"Loading X-WAM policy from {exp_path} (steps={steps}) ...")
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+        torch.set_float32_matmul_precision("high")
+        logging.info("Enabled TF32 Tensor Cores for FP32 matmul (torch float32_matmul_precision=high).")
 
         if deployment_checkpoint is not None:
             checkpoint_candidates = (deployment_checkpoint,)
@@ -219,10 +222,44 @@ class XWAMPolicy:
         self.model = self.model.to(device)
         self.model.eval()
         torch.cuda.empty_cache()
-        if compile_model:
-            self.model.model = torch.compile(self.model.model)
+        logging.info("Enabling torch.compile for the BF16 DiT; compilation occurs during warmup.")
+        self.model.model = torch.compile(self.model.model)
         self._fk = PiperXForwardKinematics()
+        self._warmup_compiled_model()
         logging.info("X-WAM policy ready.")
+
+    def _warmup_inputs(self) -> tuple[torch.Tensor, torch.Tensor, list[str], torch.Tensor | None]:
+        """Fixed post-preprocessing tensors used to compile the serving shape."""
+        height, width = self.video_size
+        rgb = torch.zeros((1, 3, 3, height, width), device=self.device, dtype=torch.bfloat16)
+        proprio = torch.zeros((1, PROPRIO_DIM), device=self.device, dtype=torch.bfloat16)
+        if self.prompt_to_embedding is not None:
+            if not self.tasks:
+                raise RuntimeError("torch.compile warmup requires at least one pre-encoded prompt embedding.")
+            return rgb, proprio, [self.tasks[0]], self._prompt_embeddings[:1].to(self.device, dtype=torch.bfloat16)
+        return rgb, proprio, [""], None
+
+    @torch.inference_mode()
+    def _warmup_compiled_model(self) -> None:
+        """Compile and validate the normal ten-step serving path before startup."""
+        logging.info("Starting two-pass torch.compile warmup for the deployment shape ...")
+        start = time.perf_counter()
+        rgb, proprio, prompt, prompt_embedding = self._warmup_inputs()
+        for seed in (0, 1):
+            _, actions, proprios, _ = self.model.generate(
+                rgb,
+                proprio,
+                prompt,
+                seeds=[seed],
+                early_stop=True,
+                cfg=0.0,
+                run_depth=False,
+                prompt_embedding=prompt_embedding,
+            )
+            if not torch.isfinite(actions).all() or not torch.isfinite(proprios).all():
+                raise RuntimeError("torch.compile warmup produced non-finite actions or proprios.")
+        torch.cuda.synchronize(self.device)
+        logging.info("torch.compile warmup finished in %.2fs.", time.perf_counter() - start)
 
     @staticmethod
     def _build_statistics(config) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -333,11 +370,31 @@ class XWAMPolicy:
     def infer(self, payload: dict) -> dict:
         t0 = time.time()
         rgb, proprio, prompt, seed, cfg, prompt_embedding = self._parse_observation(payload)
+        if self.profile:
+            # Synchronize before resetting so the reported peak belongs only to
+            # this request's generation, not startup/warmup work on the stream.
+            torch.cuda.synchronize(self.device)
+            torch.cuda.reset_peak_memory_stats(self.device)
+            gpu_start = torch.cuda.Event(enable_timing=True)
+            gpu_end = torch.cuda.Event(enable_timing=True)
+            gpu_start.record()
 
         _, xt_actions, xt_proprios, _ = self.model.generate(
-            rgb, proprio, prompt, seeds=[seed], early_stop=True, cfg=cfg, run_depth=False,
+            rgb,
+            proprio,
+            prompt,
+            seeds=[seed],
+            early_stop=True,
+            cfg=cfg,
+            run_depth=False,
             prompt_embedding=prompt_embedding,
         )
+        if not torch.isfinite(xt_actions).all() or not torch.isfinite(xt_proprios).all():
+            raise RuntimeError("torch.compile inference produced non-finite actions or proprios.")
+        inference_backend = "compile"
+
+        if self.profile:
+            gpu_end.record()
 
         actions_np = xt_actions[0].float().cpu().numpy()
         proprios_np = xt_proprios[0].float().cpu().numpy()
@@ -352,10 +409,23 @@ class XWAMPolicy:
             "view_order": ["fixed_front", "left_arm", "right_arm"],
             "prompt": prompt[0] if prompt else "",
             "seed": seed,
+            "inference_backend": inference_backend,
             "infer_time_s": time.time() - t0,
         }
+        if self.profile:
+            # The blocking D2H conversion above synchronizes the stream, so
+            # elapsed_time and peak statistics are valid at this point.
+            result["profile"] = {
+                "gpu_generate_ms": float(gpu_start.elapsed_time(gpu_end)),
+                "allocated_mib": round(torch.cuda.memory_allocated(self.device) / 2**20, 1),
+                "reserved_mib": round(torch.cuda.memory_reserved(self.device) / 2**20, 1),
+                "peak_allocated_mib": round(torch.cuda.max_memory_allocated(self.device) / 2**20, 1),
+                "peak_reserved_mib": round(torch.cuda.max_memory_reserved(self.device) / 2**20, 1),
+            }
         logging.info(
             f"infer: {result['infer_time_s']:.2f}s | actions {result['actions'].shape} "
-            f"| proprios {result['proprios'].shape} | cfg={cfg} seed={seed}"
+            f"| proprios {result['proprios'].shape} | backend={inference_backend} cfg={cfg} seed={seed}"
         )
+        if self.profile:
+            logging.info("GPU profile: %s", result["profile"])
         return result

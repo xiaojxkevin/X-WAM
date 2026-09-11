@@ -70,6 +70,28 @@ The equivalent wrapper, which fixes the current experiment/base-weight defaults,
 bash deployment/serve_xwam.sh
 ```
 
+`serve_xwam.sh` always uses the accelerated deployment path: full-DiT
+`torch.compile` plus two fixed-shape warmup passes through the default 5-step
+DiT + UniPC action/proprio denoise loop. The sampling algorithm and scheduler
+are unchanged.
+
+This path requires CUDA and the auto-detected `prompt_embeddings.pt`. There is
+no eager fallback: compilation, warmup, or a non-finite warmup output causes
+server startup to fail. The response and `get_config` metadata report
+`inference_backend: "compile"`.
+
+For a VRAM baseline on a deployment GPU, add `PROFILE=1`.  Each response and
+the server log then include GPU generation time plus allocated, reserved, and
+per-request peak VRAM in MiB:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PROFILE=1 bash deployment/serve_xwam.sh
+```
+
+Warmup runs under `torch.inference_mode()`. This is required
+for a 24 GB RTX 3090: otherwise PyTorch retains training autograd activations
+for the full multi-step denoising warmup and can OOM.
+
 ## Wire protocol
 
 Immediately after the WebSocket handshake, the server sends one binary msgpack
@@ -98,7 +120,7 @@ Otherwise the dict is an observation.
 
 | Field | Type / Shape | Notes |
 |---|---|---|
-| `actions` | `float32 [Ta, 14]` | Delta end-effector actions at `action_fps` Hz: per step `[l_dxyz(3), l_drotvec(3), l_dgrip(1), r_...]`, **relative to the pose at request time** (global frame). Robot side accumulates deltas itself (reference impl: `evaluation/X-WAM/deploy_policy.py::compute_future_poses`). |
+| `actions` | `float32 [Ta, 14]` | Delta end-effector corrections at `action_fps` Hz: per step `[l_dxyz(3), l_drotvec(3), l_dgrip(1), r_...]`, relative to the proprio/state at the **same time step** (global frame). Compose each action with its time-aligned proprio; do not accumulate it across steps. |
 | `proprios` | `float32 [Tp, 16]` | Predicted absolute EE chain at `proprio_fps` Hz, same convention as input `proprios`. |
 | `action_fps` | `float` | `raw_fps / action_skip` (e.g. 30/1 = 30 Hz with this checkpoint's `action_skip=1`... see `get_config` for the live value). |
 | `proprio_fps` | `float` | `raw_fps / frame_skip` (e.g. 30/4 = 7.5 Hz). |
@@ -169,7 +191,7 @@ or set both to `0` for initial-pose-only analysis.
   "proprio_fps": 7.5,
   "sample_steps": 50,
   "action_denoise_steps": 10,
-  "action_representation": "delta_ee_global_relative_to_request",
+  "action_representation": "delta_ee_global_relative_to_state",
   "tasks": ["...5 task strings..."],
   "prompt_must_be_task": true
 }

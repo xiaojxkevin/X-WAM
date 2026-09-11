@@ -93,7 +93,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-embeddings", type=Path, default=None, help="Optional precomputed prompt_embeddings.pt.")
     parser.add_argument("--denoise-steps", type=int, default=50)
     parser.add_argument("--action-denoise-steps", type=int, default=10)
-    parser.add_argument("--compile", action="store_true", help="Apply torch.compile, as in the serving entrypoint.")
     parser.add_argument(
         "--episode-indices",
         type=int,
@@ -545,7 +544,6 @@ def main() -> None:
         wan_checkpoint_dir=str(args.wan_checkpoint_dir),
         denoise_steps=args.denoise_steps,
         action_denoise_steps=args.action_denoise_steps,
-        compile_model=args.compile,
         prompt_embeddings=None if args.prompt_embeddings is None else str(args.prompt_embeddings),
         deployment_checkpoint=str(args.deployment_checkpoint),
     )

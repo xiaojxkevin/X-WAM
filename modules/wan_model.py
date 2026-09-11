@@ -21,8 +21,11 @@ def sinusoidal_embedding_1d(dim, position):
     half = dim // 2
     position = position.type(torch.float64)
 
-    # calculation
-    sinusoid = torch.outer(position, torch.pow(10000, -torch.arange(half).to(position).div(half)))
+    # Allocate the only tensor operand directly on CUDA.  Do not use
+    # ``torch.tensor(10000.0)`` here: scalar-tensor construction is not CUDA
+    # Graph-safe in this PyTorch version.
+    frequencies = torch.arange(half, device=position.device, dtype=position.dtype).div(half)
+    sinusoid = torch.outer(position, torch.exp(-math.log(10000.0) * frequencies))
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
     return x
 
@@ -30,26 +33,28 @@ def sinusoidal_embedding_1d(dim, position):
 @torch.amp.autocast("cuda", enabled=False)
 def rope_params(max_seq_len, dim, theta=10000, scale=1.0):
     assert dim % 2 == 0
-    freqs = torch.outer(
+    phase = torch.outer(
         torch.arange(0, max_seq_len, 1 / scale),
         1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float64).div(dim)),
     )
-    freqs = torch.polar(torch.ones_like(freqs), freqs)
-    return freqs
+    # Interleaved [cos, sin] pairs retain the original final dimension while
+    # avoiding complex tensors, which TorchInductor cannot optimize well.
+    return torch.stack((torch.cos(phase), torch.sin(phase)), dim=-1).flatten(-2)
 
 
 @torch.amp.autocast("cuda", enabled=False)
 def rope_apply_1d(x, freqs):
     """
     x:     [B, L, H, D]  (real, float)
-    freqs: [L, D//2]  (complex, from rope_params)
+    freqs: [L, D]  (interleaved cos/sin pairs, from rope_params)
     """
     B, L, H, D = x.shape
-
-    freqs = freqs.unsqueeze(0).unsqueeze(2)
-    x_complex = torch.view_as_complex(x.to(torch.float64).reshape(B, L, H, D // 2, 2))
-
-    return torch.view_as_real(x_complex * freqs).flatten(3).float()
+    x_pairs = x.to(torch.float64).reshape(B, L, H, D // 2, 2)
+    freq_pairs = freqs.to(torch.float64).reshape(L, D // 2, 2).unsqueeze(0).unsqueeze(2)
+    cos, sin = freq_pairs[..., 0], freq_pairs[..., 1]
+    real = x_pairs[..., 0] * cos - x_pairs[..., 1] * sin
+    imag = x_pairs[..., 0] * sin + x_pairs[..., 1] * cos
+    return torch.stack((real, imag), dim=-1).flatten(3).float()
 
 
 class WanRMSNorm(nn.Module):
@@ -439,8 +444,9 @@ class XWAMModel(ModelMixin, ConfigMixin):
             nn.Linear(dim, dim), nn.GELU(approximate="tanh"), nn.Linear(dim, proprio_dim)
         )
 
-        # Caches rather than registered buffers: RoPE must remain complex128,
-        # while ``Module.to(dtype=...)`` would cast registered buffers.  In
+        # Caches rather than registered buffers: RoPE remains float64 for its
+        # phase arithmetic, while ``Module.to(dtype=...)`` would cast buffers.
+        # In
         # deployment mode this constructor runs under ``torch.device('meta')``;
         # `_create_freqs` will materialize these small caches on the first CUDA
         # forward pass.

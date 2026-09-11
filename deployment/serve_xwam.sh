@@ -10,6 +10,7 @@ HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8080}"
 STEPS="${STEPS:-last}"
 DEPLOYMENT_CHECKPOINT="${DEPLOYMENT_CHECKPOINT:-${EXP_PATH}/checkpoints/${STEPS}.deployment.pt}"
+PROFILE="${PROFILE:-0}"
 
 [[ -x "${XWAM_ROOT}/.venv/bin/python" ]] || {
     echo "Missing X-WAM virtual environment: ${XWAM_ROOT}/.venv/bin/python" >&2
@@ -29,8 +30,12 @@ DEPLOYMENT_CHECKPOINT="${DEPLOYMENT_CHECKPOINT:-${EXP_PATH}/checkpoints/${STEPS}
 }
 
 cd "${XWAM_ROOT}"
+SERVER_ARGS=()
+if [[ "${PROFILE}" == "1" ]]; then
+    SERVER_ARGS+=(--profile)
+fi
 exec .venv/bin/python deployment/websocket_policy_server.py \
     --exp-path "${EXP_PATH}" \
     --wan-checkpoint-dir "${WAN_CHECKPOINT_DIR}" \
     --deployment-checkpoint "${DEPLOYMENT_CHECKPOINT}" \
-    --steps "${STEPS}" --host "${HOST}" --port "${PORT}" "$@"
+    --steps "${STEPS}" --host "${HOST}" --port "${PORT}" "${SERVER_ARGS[@]}" "$@"
